@@ -10,6 +10,7 @@ env:
   ECR_REPOSITORY: medusa-app
   ECS_CLUSTER: medusa-cluster
   ECS_SERVICE: medusa-service
+  ECS_TASK_DEFINITION: medusa-task   # <-- Your actual task definition name
 
 jobs:
   deploy:
@@ -42,7 +43,7 @@ jobs:
       id: render-task-def
       run: |
         # Download the current task definition
-        aws ecs describe-task-definition --task-definition $ECS_SERVICE > task-def.json
+        aws ecs describe-task-definition --task-definition $ECS_TASK_DEFINITION > task-def.json
 
         # Update image and environment variables
         cat task-def.json | jq '
@@ -51,7 +52,10 @@ jobs:
           .containerDefinitions[0].environment = [
             { "name": "DATABASE_URL", "value": "${{ secrets.DATABASE_URL }}" },
             { "name": "JWT_SECRET", "value": "${{ secrets.JWT_SECRET }}" },
-            { "name": "COOKIE_SECRET", "value": "${{ secrets.COOKIE_SECRET }}" }
+            { "name": "COOKIE_SECRET", "value": "${{ secrets.COOKIE_SECRET }}" },
+            { "name": "STORE_CORS", "value": "${{ secrets.STORE_CORS }}" },
+            { "name": "ADMIN_CORS", "value": "${{ secrets.ADMIN_CORS }}" },
+            { "name": "AUTH_CORS", "value": "${{ secrets.AUTH_CORS }}" }
           ]
         ' > new-task-def.json
 
