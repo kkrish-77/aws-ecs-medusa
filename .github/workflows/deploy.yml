@@ -1,93 +1,103 @@
-name: Deploy Medusa to ECS
+name: Deploy Medusa Store to AWS ECS
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
   workflow_dispatch:
-
-env:
-  AWS_REGION: ap-south-1
-  ECR_REPOSITORY: medusa-app
-  ECS_CLUSTER: medusa-cluster
-  ECS_SERVICE: medusa-service
-  ECS_TASK_DEFINITION: medusa-task
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
+      # Step 1: Checkout the code
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v2
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
+      # Step 2: Set up Docker Buildx
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-    - name: Login to Amazon ECR
-      id: login-ecr
-      uses: aws-actions/amazon-ecr-login@v1
+      # Step 3: Log in to Amazon ECR
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
 
-    - name: Build, tag, and push image to Amazon ECR
-      env:
-        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        IMAGE_TAG: ${{ github.sha }}
-      run: |
-        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+      # Step 4: Build Docker image
+      - name: Build Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/medusa-app:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/medusa-app:$IMAGE_TAG $ECR_REGISTRY/medusa-app:latest
 
-    - name: Render new ECS task definition with env vars
-      id: render-task-def
-      run: |
-        # Download the current task definition
-        aws ecs describe-task-definition --task-definition $ECS_TASK_DEFINITION > task-def.json
+      # Step 5: Push Docker image to Amazon ECR
+      - name: Push Docker image to Amazon ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker push $ECR_REGISTRY/medusa-app:$IMAGE_TAG
+          docker push $ECR_REGISTRY/medusa-app:latest
 
-        # Extract only the allowed fields for register-task-definition
-        cat task-def.json | jq '
-          .taskDefinition | {
-            family,
-            taskRoleArn,
-            executionRoleArn,
-            networkMode,
-            containerDefinitions,
-            volumes,
-            placementConstraints,
-            requiresCompatibilities,
-            cpu,
-            memory,
-            tags,
-            pidMode,
-            ipcMode,
-            proxyConfiguration,
-            inferenceAccelerators,
-            ephemeralStorage,
-            runtimePlatform
-          }
-          | .containerDefinitions[0].image = "${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
-          | .containerDefinitions[0].environment = [
+      # Step 6: Configure AWS credentials
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
+
+      # Step 7: Update ECS task definition
+      - name: Update ECS task definition
+        id: update-task-def
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition medusa-task \
+            --region ap-south-1)
+
+          NEW_TASK_DEF=$(echo "$TASK_DEF" | jq \
+            '.taskDefinition |
+            .containerDefinitions[0].image = "'$ECR_REGISTRY'/medusa-app:'$IMAGE_TAG'" |
+            .containerDefinitions[0].environment = [
               { "name": "DATABASE_URL", "value": "${{ secrets.DATABASE_URL }}" },
               { "name": "JWT_SECRET", "value": "${{ secrets.JWT_SECRET }}" },
               { "name": "COOKIE_SECRET", "value": "${{ secrets.COOKIE_SECRET }}" },
               { "name": "STORE_CORS", "value": "${{ secrets.STORE_CORS }}" },
               { "name": "ADMIN_CORS", "value": "${{ secrets.ADMIN_CORS }}" },
               { "name": "AUTH_CORS", "value": "${{ secrets.AUTH_CORS }}" }
-            ]
-        ' > new-task-def.json
+            ] |
+            del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)'
+          )
 
-        # Register the new task definition
-        NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
-          --cli-input-json file://new-task-def.json \
-          --query 'taskDefinition.taskDefinitionArn' \
-          --output text)
-        echo "task_def_arn=$NEW_TASK_DEF_ARN" >> $GITHUB_OUTPUT
+          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --region ap-south-1 \
+            --cli-input-json "$NEW_TASK_DEF" \
+            | jq -r '.taskDefinition.taskDefinitionArn')
 
-    - name: Update ECS service to use new task definition
-      run: |
-        aws ecs update-service \
-          --cluster $ECS_CLUSTER \
-          --service $ECS_SERVICE \
-          --task-definition ${{ steps.render-task-def.outputs.task_def_arn }} \
-          --force-new-deployment
+          echo "task_definition_arn=$NEW_TASK_DEF_ARN" >> $GITHUB_OUTPUT
+
+      # Step 8: Update ECS service
+      - name: Update ECS service
+        run: |
+          aws ecs update-service \
+            --cluster medusa-cluster \
+            --service medusa-service \
+            --task-definition ${{ steps.update-task-def.outputs.task_definition_arn }} \
+            --force-new-deployment \
+            --region ap-south-1
+          echo "Updated ECS service"
+
+      # Step 9: Wait for ECS service to stabilize
+      - name: Wait for ECS service to stabilize
+        run: |
+          aws ecs wait services-stable \
+            --cluster medusa-cluster \
+            --services medusa-service \
+            --region ap-south-1
+          echo "ECS service is now stable"
